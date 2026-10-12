@@ -13,7 +13,9 @@ from config import ADMIN_ID
 from filters import is_admin, is_blocked_user
 from keyboards import admin_menu_keyboard
 from conversation import handle_user_message
-
+from mafia_handlers import handle_mafia_start_payload
+from finance_handlers import register_finance_handlers
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 async def start(
     update: Update,
@@ -32,6 +34,9 @@ async def start(
         await message.reply_text(
             "Пожалуйста, напиши боту в личные сообщения."
         )
+        return
+    # Обрабатываем ссылку получения роли в игре «Мафия».
+    if await handle_mafia_start_payload(update, context):
         return
 
     # Для администратора открываем меню управления.
@@ -68,7 +73,11 @@ async def start(
         "Важно: администратор сможет видеть твой Telegram ID, "
         "имя и username, если он установлен, чтобы отвечать "
         "на сообщения и управлять обращениями.\n\n"
-        "Просто напиши своё первое сообщение!"
+        "Просто напиши своё первое сообщение!\n\n"
+        "💰 Финансы — отдельный раздел для личного учёта.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💰 Личные финансы", callback_data="finance:open")
+        ]]),
     )
 
 
@@ -101,7 +110,8 @@ async def help_command(
             "Команды:\n"
             "/start — начать общение\n"
             "/help — помощь\n"
-            "/privacy — информация о приватности"
+            "/privacy — информация о приватности\n"
+            "/finance — личный учёт доходов и расходов"
         )
 
 
@@ -147,6 +157,7 @@ async def privacy_command(
         "• Администратор может видеть твой Telegram ID, "
         "имя, username и содержание обращений.\n"
         "• История сообщений хранится для работы сервиса.\n"
+        "• Финансовые записи хранятся в базе бота на сервере; владелец сервера может получить к ним доступ.\n"
         "• Не отправляй пароли, платёжные данные "
         "или другую конфиденциальную информацию."
     )
@@ -159,6 +170,7 @@ def register_user_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", id_command))
     app.add_handler(CommandHandler("privacy", privacy_command))
+    register_finance_handlers(app)
 
     # Последним регистрируем обработчик обычных сообщений.
     # Он также передаёт сообщения администратора в режим ответа.

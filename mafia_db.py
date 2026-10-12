@@ -73,6 +73,10 @@ def init_db() -> None:
         day_number INTEGER NOT NULL DEFAULT 0,
         phase_deadline TEXT,
         winner TEXT,
+        phase_preset TEXT NOT NULL DEFAULT 'normal'
+            CHECK (phase_preset IN ('quick', 'normal')),
+        stats_recorded INTEGER NOT NULL DEFAULT 0
+            CHECK (stats_recorded IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
@@ -88,7 +92,7 @@ def init_db() -> None:
 
         role TEXT CHECK (
             role IS NULL OR
-            role IN ('mafia', 'doctor', 'detective', 'civilian')
+            role IN ('mafia', 'don', 'doctor', 'detective', 'sheriff', 'maniac', 'civilian')
         ),
 
         is_alive INTEGER NOT NULL DEFAULT 1
@@ -99,6 +103,9 @@ def init_db() -> None:
 
         role_sent INTEGER NOT NULL DEFAULT 0
             CHECK (role_sent IN (0, 1)),
+
+        is_ready INTEGER NOT NULL DEFAULT 0
+            CHECK (is_ready IN (0, 1)),
 
         joined_at TEXT NOT NULL,
 
@@ -129,7 +136,7 @@ def init_db() -> None:
         room_id INTEGER NOT NULL,
         day_number INTEGER NOT NULL,
         phase TEXT NOT NULL CHECK (
-            phase IN ('day_vote', 'mafia', 'doctor', 'detective')
+            phase IN ('day_vote', 'mafia', 'doctor', 'detective', 'sheriff', 'maniac')
         ),
         voter_id INTEGER NOT NULL,
         target_id INTEGER NOT NULL,
@@ -144,47 +151,135 @@ def init_db() -> None:
 
     CREATE INDEX IF NOT EXISTS idx_mafia_actions_room_phase
         ON mafia_actions(room_id, day_number, phase);
+
+    CREATE TABLE IF NOT EXISTS mafia_stats (
+        user_id INTEGER PRIMARY KEY,
+        games INTEGER NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        mafia_roles INTEGER NOT NULL DEFAULT 0,
+        don_roles INTEGER NOT NULL DEFAULT 0,
+        doctor_roles INTEGER NOT NULL DEFAULT 0,
+        detective_roles INTEGER NOT NULL DEFAULT 0,
+        sheriff_roles INTEGER NOT NULL DEFAULT 0,
+        maniac_roles INTEGER NOT NULL DEFAULT 0,
+        civilian_roles INTEGER NOT NULL DEFAULT 0
+    );
     """
 
     with _db() as connection:
         connection.executescript(schema)
 
+    _migrate_game_schema()
+
+
+def _migrate_game_schema() -> None:
+    """Adds new game options and role types without discarding active games."""
+    with _db() as connection:
+        room_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(mafia_rooms)")
+        }
+        if "phase_preset" not in room_columns:
+            connection.execute(
+                "ALTER TABLE mafia_rooms ADD COLUMN phase_preset TEXT NOT NULL DEFAULT 'normal'"
+            )
+        if "stats_recorded" not in room_columns:
+            connection.execute(
+                "ALTER TABLE mafia_rooms ADD COLUMN stats_recorded INTEGER NOT NULL DEFAULT 0"
+            )
+        player_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(mafia_players)")
+        }
+        if "is_ready" not in player_columns:
+            connection.execute(
+                "ALTER TABLE mafia_players ADD COLUMN is_ready INTEGER NOT NULL DEFAULT 0"
+            )
+        connection.commit()
+
+        player_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mafia_players'"
+        ).fetchone()["sql"]
+        if "'sheriff'" not in player_sql or "'maniac'" not in player_sql or "'don'" not in player_sql:
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""
+                CREATE TABLE mafia_players_new (
+                    room_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT,
+                    first_name TEXT NOT NULL,
+                    role TEXT CHECK (role IS NULL OR role IN
+                        ('mafia', 'don', 'doctor', 'detective', 'sheriff', 'maniac', 'civilian')),
+                    is_alive INTEGER NOT NULL DEFAULT 1 CHECK (is_alive IN (0, 1)),
+                    dm_ready INTEGER NOT NULL DEFAULT 0 CHECK (dm_ready IN (0, 1)),
+                    role_sent INTEGER NOT NULL DEFAULT 0 CHECK (role_sent IN (0, 1)),
+                    joined_at TEXT NOT NULL,
+                    is_ready INTEGER NOT NULL DEFAULT 0 CHECK (is_ready IN (0, 1)),
+                    PRIMARY KEY (room_id, user_id),
+                    FOREIGN KEY (room_id) REFERENCES mafia_rooms(id) ON DELETE CASCADE
+                )
+            """)
+            connection.execute("""
+                INSERT INTO mafia_players_new (
+                    room_id, user_id, username, first_name, role,
+                    is_alive, dm_ready, role_sent, joined_at, is_ready
+                ) SELECT room_id, user_id, username, first_name, role,
+                    is_alive, dm_ready, role_sent, joined_at, is_ready
+                  FROM mafia_players
+            """)
+            connection.execute("DROP TABLE mafia_players")
+            connection.execute("ALTER TABLE mafia_players_new RENAME TO mafia_players")
+            connection.execute("CREATE INDEX idx_mafia_players_user ON mafia_players(user_id)")
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = ON")
+
+        action_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mafia_actions'"
+        ).fetchone()["sql"]
+        if "'maniac'" not in action_sql or "'sheriff'" not in action_sql:
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("""
+                CREATE TABLE mafia_actions_new (
+                    room_id INTEGER NOT NULL,
+                    day_number INTEGER NOT NULL,
+                    phase TEXT NOT NULL CHECK (phase IN
+                        ('day_vote', 'mafia', 'doctor', 'detective', 'sheriff', 'maniac')),
+                    voter_id INTEGER NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (room_id, day_number, phase, voter_id),
+                    FOREIGN KEY (room_id) REFERENCES mafia_rooms(id) ON DELETE CASCADE
+                )
+            """)
+            connection.execute("""
+                INSERT INTO mafia_actions_new
+                SELECT room_id, day_number, phase, voter_id, target_id, updated_at
+                FROM mafia_actions
+            """)
+            connection.execute("DROP TABLE mafia_actions")
+            connection.execute("ALTER TABLE mafia_actions_new RENAME TO mafia_actions")
+            connection.execute("CREATE INDEX idx_mafia_actions_room_phase ON mafia_actions(room_id, day_number, phase)")
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys = ON")
+
 
 def create_room(chat_id: int, host_user_id: int) -> int:
-    """Создаёт комнату. В одном чате разрешена одна активная игра."""
-    active_statuses = (
-        "lobby",
-        "mafia_count_vote",
-        "waiting_roles",
-        "discussion",
-        "day_vote",
-        "night",
-    )
-
+    """Создаёт отдельную игровую комнату в группе."""
     now = _now()
 
     with _db() as connection:
-        placeholders = ",".join("?" for _ in active_statuses)
-        existing = connection.execute(
-            f"""
-            SELECT id
-            FROM mafia_rooms
-            WHERE chat_id = ?
-              AND status IN ({placeholders})
-            LIMIT 1
-            """,
-            (chat_id, *active_statuses),
-        ).fetchone()
-
-        if existing:
-            raise ValueError(
-                f"В этом чате уже есть активная игра №{existing['id']}."
-            )
-
         cursor = connection.execute(
             """
             INSERT INTO mafia_rooms (
-                chat_id, host_user_id, status, created_at, updated_at
+                chat_id,
+                host_user_id,
+                status,
+                created_at,
+                updated_at
             )
             VALUES (?, ?, 'lobby', ?, ?)
             """,
@@ -223,6 +318,19 @@ def get_active_room_by_chat(
         return _dict(row)
 
 
+def get_active_rooms() -> list[dict[str, Any]]:
+    """Returns rooms that still need game phase processing."""
+    with _db() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM mafia_rooms
+            WHERE status IN ('discussion', 'day_vote', 'night')
+            ORDER BY id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
 def update_room(room_id: int, **fields: Any) -> None:
     """Обновляет разрешённые поля комнаты."""
     allowed_fields = {
@@ -233,6 +341,7 @@ def update_room(room_id: int, **fields: Any) -> None:
         "day_number",
         "phase_deadline",
         "winner",
+        "phase_preset",
     }
 
     unknown_fields = set(fields) - allowed_fields
@@ -351,13 +460,74 @@ def set_dm_ready(room_id: int, user_id: int) -> bool:
         return cursor.rowcount > 0
 
 
+def set_player_ready(room_id: int, user_id: int, ready: bool = True) -> bool:
+    with _db() as connection:
+        cursor = connection.execute(
+            "UPDATE mafia_players SET is_ready = ? WHERE room_id = ? AND user_id = ?",
+            (int(ready), room_id, user_id),
+        )
+        return cursor.rowcount > 0
+
+
+def get_player_statistics(user_id: int) -> dict[str, int]:
+    with _db() as connection:
+        row = connection.execute(
+            "SELECT * FROM mafia_stats WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return {"games": 0, "wins": 0, "mafia_roles": 0, "don_roles": 0,
+                    "doctor_roles": 0, "detective_roles": 0, "sheriff_roles": 0,
+                    "maniac_roles": 0, "civilian_roles": 0}
+        return dict(row)
+
+
+def finish_room(room_id: int, winner: str) -> bool:
+    """Finalizes a game and records player statistics once."""
+    role_columns = {
+        "mafia": "mafia_roles", "don": "don_roles", "doctor": "doctor_roles",
+        "detective": "detective_roles", "sheriff": "sheriff_roles",
+        "maniac": "maniac_roles", "civilian": "civilian_roles",
+    }
+    with _db() as connection:
+        room = connection.execute(
+            "SELECT stats_recorded FROM mafia_rooms WHERE id = ?", (room_id,)
+        ).fetchone()
+        if room is None or room["stats_recorded"]:
+            return False
+        players = connection.execute(
+            "SELECT user_id, role FROM mafia_players WHERE room_id = ?", (room_id,)
+        ).fetchall()
+        for player in players:
+            role_column = role_columns.get(player["role"])
+            if role_column is None:
+                continue
+            is_win = (
+                winner == "town" and player["role"] not in {"mafia", "don", "maniac"}
+                or winner == "mafia" and player["role"] in {"mafia", "don"}
+                or winner == "maniac" and player["role"] == "maniac"
+            )
+            connection.execute(
+                f"""INSERT INTO mafia_stats (user_id, games, wins, {role_column})
+                    VALUES (?, 1, ?, 1)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        games = games + 1, wins = wins + excluded.wins,
+                        {role_column} = {role_column} + 1""",
+                (player["user_id"], int(is_win)),
+            )
+        connection.execute(
+            "UPDATE mafia_rooms SET status = 'finished', winner = ?, phase_deadline = NULL, stats_recorded = 1, updated_at = ? WHERE id = ?",
+            (winner, _now(), room_id),
+        )
+        return True
+
+
 def set_player_role(
     room_id: int,
     user_id: int,
     role: str,
 ) -> None:
     """Назначает роль игроку."""
-    if role not in {"mafia", "doctor", "detective", "civilian"}:
+    if role not in {"mafia", "don", "doctor", "detective", "sheriff", "maniac", "civilian"}:
         raise ValueError("Неизвестная роль.")
 
     with _db() as connection:
@@ -456,7 +626,7 @@ def set_action_vote(
     target_id: int,
 ) -> None:
     """Сохраняет или меняет один голос/ночное действие игрока."""
-    allowed_phases = {"day_vote", "mafia", "doctor", "detective"}
+    allowed_phases = {"day_vote", "mafia", "doctor", "detective", "sheriff", "maniac"}
     if phase not in allowed_phases:
         raise ValueError("Неизвестная игровая фаза.")
 
@@ -509,4 +679,4 @@ def clear_action_votes(
             WHERE room_id = ? AND day_number = ? AND phase = ?
             """,
             (room_id, day_number, phase),
-        )   
+        )

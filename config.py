@@ -11,6 +11,12 @@ BASE_DIR = Path(__file__).resolve().parent
 # Загружаем настройки из .env
 ENV_FILE = BASE_DIR / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
+# Временный режим проверки игры «Мафия».
+# По умолчанию выключен.
+MAFIA_TEST_MODE = (
+    os.getenv("MAFIA_TEST_MODE", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # Токен Telegram-бота
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()

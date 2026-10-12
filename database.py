@@ -91,6 +91,23 @@ def init_db() -> None:
         updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS finance_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('income', 'expense')),
+        category TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+        note TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS finance_drafts (
+        telegram_id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('income', 'expense')),
+        category TEXT,
+        updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_users_username
         ON users(username);
 
@@ -111,6 +128,9 @@ def init_db() -> None:
 
     CREATE INDEX IF NOT EXISTS idx_messages_unread
         ON messages(conversation_id, is_read, sender);
+
+    CREATE INDEX IF NOT EXISTS idx_finance_user_date
+        ON finance_transactions(telegram_id, created_at);
     """
 
     with _connect() as connection:
@@ -692,6 +712,102 @@ def get_setting(
         ).fetchone()
 
         return str(row["value"]) if row else default
+
+
+# --------------------------------------------------
+# PERSONAL FINANCE
+# --------------------------------------------------
+
+def add_finance_transaction(
+    telegram_id: int,
+    kind: str,
+    category: str,
+    amount_cents: int,
+    note: str | None = None,
+) -> int:
+    """Сохраняет финансовую запись, привязанную к Telegram ID владельца."""
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO finance_transactions (
+                telegram_id, kind, category, amount_cents, note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (telegram_id, kind, category, amount_cents, note, _now()),
+        )
+        return int(cursor.lastrowid)
+
+
+def list_finance_transactions(
+    telegram_id: int,
+    since_month: str,
+) -> list[dict[str, Any]]:
+    """Возвращает собственные записи пользователя начиная с YYYY-MM."""
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM finance_transactions
+            WHERE telegram_id = ? AND substr(created_at, 1, 7) >= ?
+            ORDER BY created_at DESC, id DESC
+            """,
+            (telegram_id, since_month),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def delete_last_finance_transaction(telegram_id: int) -> bool:
+    """Удаляет последнюю финансовую запись только её владельца."""
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT id FROM finance_transactions
+            WHERE telegram_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (telegram_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        connection.execute(
+            "DELETE FROM finance_transactions WHERE id = ? AND telegram_id = ?",
+            (row["id"], telegram_id),
+        )
+        return True
+
+
+def set_finance_draft(
+    telegram_id: int,
+    kind: str,
+    category: str | None = None,
+) -> None:
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO finance_drafts (telegram_id, kind, category, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                kind = excluded.kind,
+                category = excluded.category,
+                updated_at = excluded.updated_at
+            """,
+            (telegram_id, kind, category, _now()),
+        )
+
+
+def get_finance_draft(telegram_id: int) -> dict[str, Any] | None:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT kind, category FROM finance_drafts WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        return _dict(row)
+
+
+def clear_finance_draft(telegram_id: int) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "DELETE FROM finance_drafts WHERE telegram_id = ?",
+            (telegram_id,),
+        )
 
 
 # --------------------------------------------------

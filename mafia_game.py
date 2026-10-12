@@ -4,9 +4,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import mafia_db
+from config import MAFIA_TEST_MODE
 
 
-MIN_PLAYERS = 5
+MIN_PLAYERS = 2 if MAFIA_TEST_MODE else 3
 TWO_MAFIA_MIN_PLAYERS = 7
 
 DISCUSSION_SECONDS = 120
@@ -15,8 +16,11 @@ NIGHT_SECONDS = 60
 
 ROLE_LABELS = {
     "mafia": "🔫 Мафия",
+    "don": "🕴 Дон мафии",
     "doctor": "🩺 Доктор",
     "detective": "🕵️ Детектив",
+    "sheriff": "⭐ Шериф",
+    "maniac": "🔪 Маньяк",
     "civilian": "👤 Мирный житель",
 }
 
@@ -65,15 +69,17 @@ def _get_winner(room_id: int) -> str | None:
     players = mafia_db.get_players(room_id)
     alive_players = [p for p in players if p["is_alive"]]
 
-    mafia_count = sum(
-        1 for p in alive_players if p["role"] == "mafia"
-    )
-    other_count = len(alive_players) - mafia_count
+    mafia_count = sum(1 for p in alive_players if p["role"] in {"mafia", "don"})
+    maniac_count = sum(1 for p in alive_players if p["role"] == "maniac")
+    town_count = len(alive_players) - mafia_count - maniac_count
 
-    if mafia_count == 0:
+    if mafia_count == 0 and maniac_count == 0:
         return "town"
 
-    if mafia_count >= other_count:
+    if maniac_count == 1 and mafia_count == 0 and town_count == 0:
+        return "maniac"
+
+    if mafia_count > 0 and mafia_count >= town_count + maniac_count:
         return "mafia"
 
     return None
@@ -84,12 +90,7 @@ def _finish_if_won(room_id: int) -> str | None:
     winner = _get_winner(room_id)
 
     if winner is not None:
-        mafia_db.update_room(
-            room_id,
-            status="finished",
-            winner=winner,
-            phase_deadline=None,
-        )
+        mafia_db.finish_room(room_id, winner)
 
     return winner
 
@@ -251,28 +252,53 @@ def assign_roles(room_id: int) -> dict[int, str]:
                 "Попросите каждого нажать «Получить роль» и Start."
             )
 
-        mafia_count = int(room["mafia_count"])
-
-        if mafia_count == 2 and len(players) < TWO_MAFIA_MIN_PLAYERS:
+        # В тестовом режиме для двух игроков
+        # используем только две роли.
+        if MAFIA_TEST_MODE and len(players) == 2:
             mafia_count = 1
-            connection.execute(
-                """
-                UPDATE mafia_rooms
-                SET mafia_count = 1
-                WHERE id = ?
-                """,
-                (room_id,),
-            )
+            roles = ["mafia", "civilian"]
+        elif len(players) == 3:
+            mafia_count = 1
+            roles = ["mafia", "sheriff", "civilian"]
+        elif len(players) == 4:
+            mafia_count = 1
+            roles = ["mafia", "sheriff", "doctor", "civilian"]
+        elif len(players) >= 9:
+            mafia_count = int(room["mafia_count"])
+            mafia_count = 2 if mafia_count == 2 else 1
+            roles = (
+                ["don", "mafia"] if mafia_count == 2 else ["mafia"]
+            ) + ["doctor", "sheriff", "maniac"]
+            roles += ["civilian"] * (len(players) - len(roles))
+        else:
+            mafia_count = int(room["mafia_count"])
 
-        if mafia_count not in (1, 2):
-            raise MafiaGameError("Некорректное число мафиози.")
+            if (
+                mafia_count == 2
+                and len(players) < TWO_MAFIA_MIN_PLAYERS
+            ):
+                mafia_count = 1
 
-        roles = (
-            ["mafia"] * mafia_count
-            + ["doctor", "detective"]
-            + ["civilian"] * (len(players) - mafia_count - 2)
-        )
+                connection.execute(
+                    """
+                    UPDATE mafia_rooms
+                    SET mafia_count = 1
+                    WHERE id = ?
+                    """,
+                    (room_id,),
+                )
 
+            if mafia_count not in (1, 2):
+                raise MafiaGameError(
+                    "Некорректное число мафиози."
+                )
+
+            mafia_roles = ["don", "mafia"] if mafia_count == 2 else ["mafia"]
+            special_roles = ["doctor", "sheriff"]
+            roles = mafia_roles + special_roles
+            roles += ["civilian"] * (len(players) - len(roles))
+
+        # Role order must not reveal the first player as the mafia.
         random.SystemRandom().shuffle(roles)
 
         result: dict[int, str] = {}
@@ -294,7 +320,7 @@ def assign_roles(room_id: int) -> dict[int, str]:
         return result
 
 
-def begin_game_after_roles_sent(room_id: int) -> None:
+def begin_game_after_roles_sent(room_id: int, discussion_seconds: int | None = None) -> None:
     """Начинает первый день только после отправки всех ролей."""
     room = _get_room(room_id)
 
@@ -320,7 +346,31 @@ def begin_game_after_roles_sent(room_id: int) -> None:
         room_id,
         status="discussion",
         day_number=1,
-        phase_deadline=_deadline(DISCUSSION_SECONDS),
+        phase_deadline=_deadline(discussion_seconds or DISCUSSION_SECONDS),
+    )
+
+
+def start_day_vote(room_id: int, vote_seconds: int | None = None) -> None:
+    """Moves the game from discussion into the timed vote phase."""
+    room = _get_room(room_id)
+    if room["status"] != "discussion":
+        raise MafiaGameError("Сейчас нельзя начать дневное голосование.")
+    mafia_db.update_room(
+        room_id,
+        status="day_vote",
+        phase_deadline=_deadline(vote_seconds or DAY_VOTE_SECONDS),
+    )
+
+
+def start_night(room_id: int, night_seconds: int | None = None) -> None:
+    """Starts the night after a tie or a day with no votes."""
+    room = _get_room(room_id)
+    if room["status"] != "day_vote":
+        raise MafiaGameError("Дневное голосование уже завершено.")
+    mafia_db.update_room(
+        room_id,
+        status="night",
+        phase_deadline=_deadline(night_seconds or NIGHT_SECONDS),
     )
 
 
@@ -374,7 +424,7 @@ def cast_night_action(
     if room["status"] != "night":
         raise MafiaGameError("Сейчас ночная фаза не идёт.")
 
-    if phase not in {"mafia", "doctor", "detective"}:
+    if phase not in {"mafia", "doctor", "detective", "sheriff", "maniac"}:
         raise MafiaGameError("Неизвестное ночное действие.")
 
     actor = _get_alive_player(room_id, user_id)
@@ -384,18 +434,22 @@ def cast_night_action(
         "mafia": "mafia",
         "doctor": "doctor",
         "detective": "detective",
+        "sheriff": "sheriff",
+        "maniac": "maniac",
     }[phase]
 
-    if actor["role"] != required_role:
+    if actor["role"] != required_role and not (
+        phase == "mafia" and actor["role"] == "don"
+    ):
         raise MafiaGameError("Твоя роль не может выполнять это действие.")
 
     if target["role"] is None:
         raise MafiaGameError("Роль цели ещё не назначена.")
 
-    if phase == "mafia" and target["role"] == "mafia":
+    if phase == "mafia" and target["role"] in {"mafia", "don"}:
         raise MafiaGameError("Мафия не может выбрать другого мафиози.")
 
-    if phase == "detective" and user_id == target_id:
+    if phase in {"detective", "sheriff"} and user_id == target_id:
         raise MafiaGameError("Нельзя проверить самого себя.")
 
     mafia_db.set_action_vote(
@@ -406,13 +460,15 @@ def cast_night_action(
         target_id=target_id,
     )
 
-    if phase == "detective":
+    if phase in {"detective", "sheriff"}:
+        if phase == "sheriff" and target["role"] == "don":
+            return "civilian"
         return str(target["role"])
 
     return None
 
 
-def resolve_day_vote(room_id: int) -> dict[str, Any]:
+def resolve_day_vote(room_id: int, night_seconds: int | None = None) -> dict[str, Any]:
     """
     Подсчитывает дневные голоса и при необходимости исключает игрока.
 
@@ -488,7 +544,7 @@ def resolve_day_vote(room_id: int) -> dict[str, Any]:
         mafia_db.update_room(
             room_id,
             status="night",
-            phase_deadline=_deadline(NIGHT_SECONDS),
+            phase_deadline=_deadline(night_seconds or NIGHT_SECONDS),
         )
 
     eliminated = player_by_id[eliminated_id]
@@ -503,7 +559,7 @@ def resolve_day_vote(room_id: int) -> dict[str, Any]:
     }
 
 
-def resolve_night(room_id: int) -> dict[str, Any]:
+def resolve_night(room_id: int, discussion_seconds: int | None = None) -> dict[str, Any]:
     """
     Завершает ночь: обрабатывает выбор мафии и защиту доктора.
     Если партия продолжается, переводит комнату к новому дню.
@@ -523,6 +579,7 @@ def resolve_night(room_id: int) -> dict[str, Any]:
     doctor_votes = mafia_db.get_action_votes(
         room_id, day_number, "doctor"
     )
+    maniac_votes = mafia_db.get_action_votes(room_id, day_number, "maniac")
 
     tally: Counter[int] = Counter()
 
@@ -534,10 +591,10 @@ def resolve_night(room_id: int) -> dict[str, Any]:
         if not voter or not target:
             continue
 
-        if not voter["is_alive"] or voter["role"] != "mafia":
+        if not voter["is_alive"] or voter["role"] not in {"mafia", "don"}:
             continue
 
-        if not target["is_alive"] or target["role"] == "mafia":
+        if not target["is_alive"] or target["role"] in {"mafia", "don"}:
             continue
 
         tally[target_id] += 1
@@ -571,11 +628,28 @@ def resolve_night(room_id: int) -> dict[str, Any]:
         ):
             protected_id = target_id
 
-    killed_id: int | None = None
+    maniac_tally: Counter[int] = Counter()
+    for vote in maniac_votes:
+        actor = player_by_id.get(int(vote["voter_id"]))
+        target_id = int(vote["target_id"])
+        target = player_by_id.get(target_id)
+        if actor and target and actor["is_alive"] and actor["role"] == "maniac" and target["is_alive"]:
+            maniac_tally[target_id] += 1
+    maniac_victim = None
+    if maniac_tally:
+        highest = max(maniac_tally.values())
+        leaders = [target_id for target_id, total in maniac_tally.items() if total == highest]
+        if len(leaders) == 1:
+            maniac_victim = leaders[0]
+
+    killed_ids: set[int] = set()
 
     if victim_id is not None and victim_id != protected_id:
         mafia_db.set_player_alive(room_id, victim_id, False)
-        killed_id = victim_id
+        killed_ids.add(victim_id)
+    if maniac_victim is not None and maniac_victim != protected_id and maniac_victim not in killed_ids:
+        mafia_db.set_player_alive(room_id, maniac_victim, False)
+        killed_ids.add(maniac_victim)
 
     winner = _finish_if_won(room_id)
 
@@ -584,11 +658,11 @@ def resolve_night(room_id: int) -> dict[str, Any]:
             room_id,
             status="discussion",
             day_number=day_number + 1,
-            phase_deadline=_deadline(DISCUSSION_SECONDS),
+            phase_deadline=_deadline(discussion_seconds or DISCUSSION_SECONDS),
         )
 
     return {
-        "killed": killed_id,
+        "killed": sorted(killed_ids),
         "protected": protected_id,
         "winner": winner,
         "next_phase": None if winner else "discussion",
