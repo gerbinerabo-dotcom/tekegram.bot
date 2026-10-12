@@ -1,5 +1,6 @@
 
 import logging
+import time
 
 from telegram import Update
 from telegram.error import TelegramError
@@ -17,6 +18,44 @@ from keyboards import (
 logger = logging.getLogger(__name__)
 
 REPLY_STATE_KEY = "active_reply_conversation_id"
+SPAM_TIMESTAMPS_KEY = "incoming_message_timestamps"
+SPAM_COOLDOWN_KEY = "incoming_message_cooldown_until"
+SPAM_WARNING_KEY = "incoming_message_cooldown_warned"
+SPAM_WINDOW_SECONDS = 2.0
+SPAM_MAX_MESSAGES = 5
+SPAM_COOLDOWN_SECONDS = 15.0
+
+
+def _check_incoming_rate_limit(user_data: dict) -> tuple[bool, bool]:
+    """Limits bursts from one sender; returns (limited, should_warn)."""
+    now = time.monotonic()
+    cooldown_until = user_data.get(SPAM_COOLDOWN_KEY, 0.0)
+
+    if now < cooldown_until:
+        if user_data.get(SPAM_WARNING_KEY):
+            return True, False
+        user_data[SPAM_WARNING_KEY] = True
+        return True, True
+
+    if cooldown_until:
+        user_data.pop(SPAM_COOLDOWN_KEY, None)
+        user_data.pop(SPAM_WARNING_KEY, None)
+
+    timestamps = [
+        sent_at
+        for sent_at in user_data.get(SPAM_TIMESTAMPS_KEY, [])
+        if now - sent_at < SPAM_WINDOW_SECONDS
+    ]
+
+    if len(timestamps) >= SPAM_MAX_MESSAGES:
+        user_data[SPAM_TIMESTAMPS_KEY] = timestamps
+        user_data[SPAM_COOLDOWN_KEY] = now + SPAM_COOLDOWN_SECONDS
+        user_data[SPAM_WARNING_KEY] = True
+        return True, True
+
+    timestamps.append(now)
+    user_data[SPAM_TIMESTAMPS_KEY] = timestamps
+    return False, False
 
 
 def extract_message_data(message):
@@ -131,6 +170,16 @@ async def handle_user_message(
         await message.reply_text(
             "Сервис временно недоступен. Попробуйте позже."
         )
+        return
+
+    # Do not let a rapid burst flood the owner's inbox.
+    rate_limited, should_warn = _check_incoming_rate_limit(context.user_data)
+    if rate_limited:
+        if should_warn:
+            await message.reply_text(
+                "Ты отправляешь сообщения слишком быстро. "
+                "Обращения приостановлены на 15 секунд — потом можно продолжить."
+            )
         return
 
     # Получаем существующий диалог или создаём новый.
@@ -269,18 +318,18 @@ async def begin_reply(
     if query.message is not None:
         await query.message.reply_text(
             f"✍️ Режим ответа включён для диалога №{conversation_id}.\n\n"
-            "Отправь следующим сообщением текст, фото, GIF, стикер "
-            "или другой поддерживаемый тип сообщения.\n"
-            "Бот доставит его пользователю от своего имени.",
-            reply_markup=reply_cancel_keyboard(),
+            "Отправляй сообщения — бот будет доставлять их этому пользователю.\n"
+            "Чтобы закончить, нажми кнопку отмены.",
+            reply_markup=reply_cancel_keyboard(conversation_id),
         )
 
 
 async def cancel_reply(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    conversation_id: int,
 ):
-    """Отменяет текущий режим ответа."""
+    """Отменяет выбранный режим ответа, не затрагивая другой диалог."""
 
     query = update.callback_query
 
@@ -291,12 +340,22 @@ async def cancel_reply(
         await query.answer("Доступ запрещён.", show_alert=True)
         return
 
+    active_conversation_id = context.user_data.get(REPLY_STATE_KEY)
+    if active_conversation_id != conversation_id:
+        await query.answer("Этот режим ответа уже завершён или выбран другой диалог.")
+        if query.message is not None:
+            await query.message.edit_reply_markup(reply_markup=None)
+        return
+
     context.user_data.pop(REPLY_STATE_KEY, None)
 
     await query.answer("Ответ отменён.")
 
     if query.message is not None:
-        await query.message.reply_text("❌ Режим ответа отменён.")
+        await query.message.edit_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"❌ Режим ответа для диалога №{conversation_id} отменён."
+        )
 
 
 async def handle_admin_reply(
@@ -349,8 +408,6 @@ async def handle_admin_reply(
             telegram_message_id=message.message_id,
             is_read=True,
         )
-
-        context.user_data.pop(REPLY_STATE_KEY, None)
 
         await message.reply_text(
             f"✅ Ответ отправлен пользователю из диалога №{conversation_id}."

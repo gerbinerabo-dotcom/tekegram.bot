@@ -365,8 +365,13 @@ async def handle_admin_callback(
     data = query.data
 
     # Эти действия обрабатываются отдельными функциями.
-    if data == "reply:cancel":
-        await cancel_reply(update, context)
+    if data.startswith("reply:cancel:"):
+        try:
+            conversation_id = int(data.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            await query.answer("Некорректный номер диалога.", show_alert=True)
+            return
+        await cancel_reply(update, context, conversation_id)
         return
 
     if data.startswith("reply:"):

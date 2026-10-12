@@ -279,14 +279,14 @@ def history_keyboard(
     return InlineKeyboardMarkup(buttons)
 
 
-def reply_cancel_keyboard():
+def reply_cancel_keyboard(conversation_id):
     """Кнопка отмены режима ответа."""
 
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "❌ Отменить ответ",
-                callback_data="reply:cancel",
+                callback_data=f"reply:cancel:{conversation_id}",
             )
         ]
     ])
