@@ -252,5 +252,6 @@ def register_finance_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(handle_finance_callback, pattern=r"^finance:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_finance_text),
-        group=-1,
+        # Run before the generic admin-message handler, which also uses -1.
+        group=-2,
     )
