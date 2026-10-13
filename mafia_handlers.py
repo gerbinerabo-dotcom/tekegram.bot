@@ -327,8 +327,8 @@ def _room_text(room_id: int) -> str:
             name = player["first_name"]
             if player["username"]:
                 name += f" (@{player['username']})"
-            name += " ✅" if player.get("is_ready") else ""
-            name += " 📩" if player.get("dm_ready") else ""
+            name += " ✅ готов" if player.get("is_ready") else " ⏳ не готов"
+            name += " · 📩 личка" if player.get("dm_ready") else " · нет лички"
             lines.append(f"{number}. {name}")
     else:
         lines.append("Пока никто не присоединился.")
@@ -338,10 +338,10 @@ def _room_text(room_id: int) -> str:
         dm_count = sum(1 for player in players if player["dm_ready"])
         lines.extend([
             "",
-            f"Для начала нужно минимум {mafia_game.MIN_PLAYERS} игроков.",
-            f"Готовы: {ready_count}/{len(players)} · открыли личный чат: {dm_count}/{len(players)}.",
-            "⚡ Для быстрой игры с одной мафией используйте «Быстрый старт».",
-            "Для больших партий сохранено голосование за количество мафии.",
+            f"Минимум для старта: {mafia_game.MIN_PLAYERS} игрока.",
+            f"Готовы: {ready_count}/{len(players)} · личный чат открыт: {dm_count}/{len(players)}.",
+            "Как начать: вступите в игру, затем откройте личный чат с ботом кнопкой «Получить роль» и нажмите Start.",
+            "Ведущий может выбрать быстрый старт с одной мафией или обычный режим.",
             f"Темп фаз: {'быстрый' if room.get('phase_preset') == 'quick' else 'обычный'}.",
         ])
     elif room["status"] == "mafia_count_vote":
@@ -394,20 +394,11 @@ async def _keyboard(
 
     if room["status"] == "lobby":
         rows.append([
-            InlineKeyboardButton(
-                "✅ Присоединиться",
-                callback_data=f"mafia:join:{room_id}",
-            ),
-            InlineKeyboardButton(
-                "🚪 Выйти",
-                callback_data=f"mafia:leave:{room_id}",
-            ),
+            InlineKeyboardButton("✅ Вступить в игру", callback_data=f"mafia:join:{room_id}"),
+            InlineKeyboardButton("🚪 Выйти", callback_data=f"mafia:leave:{room_id}"),
         ])
+        rows.append([InlineKeyboardButton("🎭 Открыть личный чат и получить роль", url=role_url)])
         rows.append([
-            InlineKeyboardButton("🎭 Получить роль", url=role_url),
-        ])
-        rows.append([
-            InlineKeyboardButton("🙋 Я готов", callback_data=f"mafia:ready:{room_id}"),
             InlineKeyboardButton(
                 "⏱ Темп: быстрый" if room.get("phase_preset") == "quick" else "⏱ Темп: обычный",
                 callback_data=f"mafia:preset:{room_id}",
@@ -851,6 +842,8 @@ async def handle_mafia_callback(
                 first_name=user.first_name or "Игрок",
                 username=user.username,
             )
+            # Вступление подтверждает участие; отдельно нажимать «Я готов» не нужно.
+            mafia_db.set_player_ready(room_id, user.id, True)
             result_message = "✅ Ты присоединился к игре!"
 
         elif action == "ready":
@@ -1052,6 +1045,7 @@ async def handle_mafia_start_payload(
         return True
 
     mafia_db.set_dm_ready(room_id, user.id)
+    mafia_db.set_player_ready(room_id, user.id, True)
     await _refresh_room_post(room_id, context)
     room = mafia_db.get_room(room_id)
     player = mafia_db.get_player(room_id, user.id)
@@ -1072,9 +1066,8 @@ async def handle_mafia_start_payload(
     if room["status"] != "waiting_roles":
         await message.reply_text(
             "✅ Личный чат подключён!\n\n"
-            "Дождись, пока создатель выберет обычное голосование "
-            "или нажмёт «⚡ Быстрый старт». Роли выдадутся, когда "
-            "все игроки будут готовы."
+            "Ты отмечен как готовый. Дождись, пока ведущий запустит игру. "
+            "Роль придёт сюда, когда личные чаты откроют все участники."
         )
         return True
 
