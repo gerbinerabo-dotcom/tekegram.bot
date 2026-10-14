@@ -157,12 +157,26 @@ def init_db() -> None:
         games INTEGER NOT NULL DEFAULT 0,
         wins INTEGER NOT NULL DEFAULT 0,
         mafia_roles INTEGER NOT NULL DEFAULT 0,
+        mafia_role_games INTEGER NOT NULL DEFAULT 0,
+        mafia_role_wins INTEGER NOT NULL DEFAULT 0,
         don_roles INTEGER NOT NULL DEFAULT 0,
+        don_role_games INTEGER NOT NULL DEFAULT 0,
+        don_role_wins INTEGER NOT NULL DEFAULT 0,
         doctor_roles INTEGER NOT NULL DEFAULT 0,
+        doctor_role_games INTEGER NOT NULL DEFAULT 0,
+        doctor_role_wins INTEGER NOT NULL DEFAULT 0,
         detective_roles INTEGER NOT NULL DEFAULT 0,
+        detective_role_games INTEGER NOT NULL DEFAULT 0,
+        detective_role_wins INTEGER NOT NULL DEFAULT 0,
         sheriff_roles INTEGER NOT NULL DEFAULT 0,
+        sheriff_role_games INTEGER NOT NULL DEFAULT 0,
+        sheriff_role_wins INTEGER NOT NULL DEFAULT 0,
         maniac_roles INTEGER NOT NULL DEFAULT 0,
-        civilian_roles INTEGER NOT NULL DEFAULT 0
+        maniac_role_games INTEGER NOT NULL DEFAULT 0,
+        maniac_role_wins INTEGER NOT NULL DEFAULT 0,
+        civilian_roles INTEGER NOT NULL DEFAULT 0,
+        civilian_role_games INTEGER NOT NULL DEFAULT 0,
+        civilian_role_wins INTEGER NOT NULL DEFAULT 0
     );
     """
 
@@ -170,6 +184,28 @@ def init_db() -> None:
         connection.executescript(schema)
 
     _migrate_game_schema()
+    _migrate_role_win_statistics()
+
+
+def _migrate_role_win_statistics() -> None:
+    """Adds per-role win counters without replacing existing statistics."""
+    role_win_columns = (
+        "mafia_role_games", "mafia_role_wins", "don_role_games", "don_role_wins",
+        "doctor_role_games", "doctor_role_wins", "detective_role_games",
+        "detective_role_wins", "sheriff_role_games", "sheriff_role_wins",
+        "maniac_role_games", "maniac_role_wins", "civilian_role_games",
+        "civilian_role_wins",
+    )
+    with _db() as connection:
+        existing = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(mafia_stats)")
+        }
+        for column in role_win_columns:
+            if column not in existing:
+                connection.execute(
+                    f"ALTER TABLE mafia_stats ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
 
 
 def _migrate_game_schema() -> None:
@@ -477,16 +513,28 @@ def get_player_statistics(user_id: int) -> dict[str, int]:
         if row is None:
             return {"games": 0, "wins": 0, "mafia_roles": 0, "don_roles": 0,
                     "doctor_roles": 0, "detective_roles": 0, "sheriff_roles": 0,
-                    "maniac_roles": 0, "civilian_roles": 0}
+                    "maniac_roles": 0, "civilian_roles": 0,
+                    "mafia_role_wins": 0, "don_role_wins": 0,
+                    "doctor_role_wins": 0, "detective_role_wins": 0,
+                    "sheriff_role_wins": 0, "maniac_role_wins": 0,
+                    "civilian_role_wins": 0,
+                    "mafia_role_games": 0, "don_role_games": 0,
+                    "doctor_role_games": 0, "detective_role_games": 0,
+                    "sheriff_role_games": 0, "maniac_role_games": 0,
+                    "civilian_role_games": 0}
         return dict(row)
 
 
 def finish_room(room_id: int, winner: str) -> bool:
     """Finalizes a game and records player statistics once."""
     role_columns = {
-        "mafia": "mafia_roles", "don": "don_roles", "doctor": "doctor_roles",
-        "detective": "detective_roles", "sheriff": "sheriff_roles",
-        "maniac": "maniac_roles", "civilian": "civilian_roles",
+        "mafia": ("mafia_roles", "mafia_role_games", "mafia_role_wins"),
+        "don": ("don_roles", "don_role_games", "don_role_wins"),
+        "doctor": ("doctor_roles", "doctor_role_games", "doctor_role_wins"),
+        "detective": ("detective_roles", "detective_role_games", "detective_role_wins"),
+        "sheriff": ("sheriff_roles", "sheriff_role_games", "sheriff_role_wins"),
+        "maniac": ("maniac_roles", "maniac_role_games", "maniac_role_wins"),
+        "civilian": ("civilian_roles", "civilian_role_games", "civilian_role_wins"),
     }
     with _db() as connection:
         room = connection.execute(
@@ -498,21 +546,26 @@ def finish_room(room_id: int, winner: str) -> bool:
             "SELECT user_id, role FROM mafia_players WHERE room_id = ?", (room_id,)
         ).fetchall()
         for player in players:
-            role_column = role_columns.get(player["role"])
-            if role_column is None:
+            role_columns_for_player = role_columns.get(player["role"])
+            if role_columns_for_player is None:
                 continue
+            role_column, role_games_column, role_win_column = role_columns_for_player
             is_win = (
                 winner == "town" and player["role"] not in {"mafia", "don", "maniac"}
                 or winner == "mafia" and player["role"] in {"mafia", "don"}
                 or winner == "maniac" and player["role"] == "maniac"
             )
             connection.execute(
-                f"""INSERT INTO mafia_stats (user_id, games, wins, {role_column})
-                    VALUES (?, 1, ?, 1)
+                f"""INSERT INTO mafia_stats (
+                        user_id, games, wins, {role_column},
+                        {role_games_column}, {role_win_column}
+                    ) VALUES (?, 1, ?, 1, 1, ?)
                     ON CONFLICT(user_id) DO UPDATE SET
                         games = games + 1, wins = wins + excluded.wins,
-                        {role_column} = {role_column} + 1""",
-                (player["user_id"], int(is_win)),
+                        {role_column} = {role_column} + 1,
+                        {role_games_column} = {role_games_column} + 1,
+                        {role_win_column} = {role_win_column} + excluded.{role_win_column}""",
+                (player["user_id"], int(is_win), int(is_win)),
             )
         connection.execute(
             "UPDATE mafia_rooms SET status = 'finished', winner = ?, phase_deadline = NULL, stats_recorded = 1, updated_at = ? WHERE id = ?",

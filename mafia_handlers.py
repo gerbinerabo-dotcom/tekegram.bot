@@ -15,6 +15,7 @@ import logging
 
 import mafia_db
 import mafia_game
+from payment_handlers import has_mafia_plus_access
 
 logger = logging.getLogger(__name__)
 
@@ -583,21 +584,36 @@ async def mafia_command(
     mafia_db.update_room(room_id, message_id=sent_message.message_id)
 
 
-def _statistics_text(user_id: int) -> str:
+def _statistics_text(user_id: int, *, extended: bool = False) -> str:
     stats = mafia_db.get_player_statistics(user_id)
     win_rate = round(100 * stats["wins"] / stats["games"]) if stats["games"] else 0
-    return (
+    lines = [
         "📊 Твоя статистика в «Мафии»\n\n"
         f"Сыграно партий: {stats['games']}\n"
-        f"Побед: {stats['wins']} ({win_rate}%)\n\n"
-        f"🔫 Мафия: {stats['mafia_roles']}\n"
-        f"🕴 Дон: {stats['don_roles']}\n"
-        f"🩺 Доктор: {stats['doctor_roles']}\n"
-        f"🕵️ Детектив: {stats['detective_roles']}\n"
-        f"⭐ Шериф: {stats['sheriff_roles']}\n"
-        f"🔪 Маньяк: {stats['maniac_roles']}\n"
-        f"👤 Мирный: {stats['civilian_roles']}"
-    )
+        f"Побед: {stats['wins']} ({win_rate}%)"
+    ]
+    if extended:
+        role_labels = (
+            ("mafia", "🔫 Мафия"), ("don", "🕴 Дон"),
+            ("doctor", "🩺 Доктор"), ("detective", "🕵️ Детектив"),
+            ("sheriff", "⭐ Шериф"), ("maniac", "🔪 Маньяк"),
+            ("civilian", "👤 Мирный"),
+        )
+        lines.extend(["", "Победы по ролям (учитываются с момента обновления статистики):"])
+        for role, label in role_labels:
+            games = int(stats[f"{role}_role_games"])
+            wins = int(stats[f"{role}_role_wins"])
+            rate = round(100 * wins / games) if games else 0
+            lines.append(f"{label}: {wins}/{games} побед ({rate}%)")
+    else:
+        lines.extend([
+            "", "Роли сыграны:",
+            f"🔫 Мафия: {stats['mafia_roles']} · 🕴 Дон: {stats['don_roles']}",
+            f"🩺 Доктор: {stats['doctor_roles']} · 🕵️ Детектив: {stats['detective_roles']}",
+            f"⭐ Шериф: {stats['sheriff_roles']} · 🔪 Маньяк: {stats['maniac_roles']}",
+            f"👤 Мирный: {stats['civilian_roles']}",
+        ])
+    return "\n".join(lines)
 
 
 ROLE_RULES = {
@@ -613,8 +629,13 @@ ROLE_RULES = {
 
 async def mafia_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message is not None and update.effective_user is not None:
+        user_id = update.effective_user.id
+        extended = has_mafia_plus_access(user_id)
+        keyboard = None if extended else InlineKeyboardMarkup([[
+            InlineKeyboardButton("⭐ Купить доступ к Mafia+", callback_data="payments:terms")
+        ]])
         await update.effective_message.reply_text(
-            _statistics_text(update.effective_user.id)
+            _statistics_text(user_id, extended=extended), reply_markup=keyboard
         )
 
 
@@ -795,7 +816,13 @@ async def handle_mafia_callback(
         if action == "stats":
             await query.answer()
             if query.message is not None:
-                await query.message.reply_text(_statistics_text(user.id))
+                extended = has_mafia_plus_access(user.id)
+                keyboard = None if extended else InlineKeyboardMarkup([[
+                    InlineKeyboardButton("⭐ Купить доступ к Mafia+", callback_data="payments:terms")
+                ]])
+                await query.message.reply_text(
+                    _statistics_text(user.id, extended=extended), reply_markup=keyboard
+                )
             return
 
         if action in {"vote", "night"}:

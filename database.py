@@ -6,6 +6,16 @@ from typing import Any
 from config import DATABASE_PATH
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Commits or rolls back on context exit, then always closes the handle."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 def _now() -> str:
     """Возвращает текущее время UTC в ISO-формате."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -16,6 +26,7 @@ def _connect() -> sqlite3.Connection:
     connection = sqlite3.connect(
         str(DATABASE_PATH),
         timeout=10,
+        factory=_ClosingConnection,
     )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -108,6 +119,24 @@ def init_db() -> None:
         updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS purchases (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER NOT NULL,
+        product_id TEXT NOT NULL,
+        amount_stars INTEGER NOT NULL CHECK (amount_stars > 0),
+        currency TEXT NOT NULL,
+        invoice_payload TEXT NOT NULL UNIQUE,
+        telegram_payment_charge_id TEXT UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'paid', 'refunded', 'rejected')),
+        created_at TEXT NOT NULL,
+        purchased_at TEXT,
+        refunded_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_purchases_user_status
+        ON purchases(telegram_id, status, product_id);
+
     CREATE INDEX IF NOT EXISTS idx_users_username
         ON users(username);
 
@@ -135,6 +164,143 @@ def init_db() -> None:
 
     with _connect() as connection:
         connection.executescript(schema)
+
+
+def create_purchase_intent(
+    telegram_id: int,
+    product_id: str,
+    amount_stars: int,
+    currency: str,
+    invoice_payload: str,
+) -> int:
+    """Stores a pending invoice; this does not grant access."""
+    with _connect() as connection:
+        cursor = connection.execute(
+            """INSERT INTO purchases (
+                telegram_id, product_id, amount_stars, currency,
+                invoice_payload, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?)""",
+            (telegram_id, product_id, amount_stars, currency, invoice_payload, _now()),
+        )
+        return int(cursor.lastrowid)
+
+
+def get_purchase_by_payload(invoice_payload: str) -> dict[str, Any] | None:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM purchases WHERE invoice_payload = ?",
+            (invoice_payload,),
+        ).fetchone()
+        return _dict(row)
+
+
+def reject_pending_purchase(invoice_payload: str) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute(
+            "UPDATE purchases SET status = 'rejected' WHERE invoice_payload = ? AND status = 'pending'",
+            (invoice_payload,),
+        )
+        return cursor.rowcount == 1
+
+
+def record_successful_star_payment(
+    telegram_id: int,
+    product_id: str,
+    amount_stars: int,
+    currency: str,
+    invoice_payload: str,
+    charge_id: str,
+) -> str:
+    """Validates and records a payment exactly once; returns a result code."""
+    with _connect() as connection:
+        purchase = connection.execute(
+            "SELECT * FROM purchases WHERE invoice_payload = ?",
+            (invoice_payload,),
+        ).fetchone()
+        if purchase is None:
+            if connection.execute(
+                "SELECT 1 FROM purchases WHERE telegram_payment_charge_id = ?",
+                (charge_id,),
+            ).fetchone():
+                return "duplicate_charge"
+            connection.execute(
+                """INSERT INTO purchases (
+                    telegram_id, product_id, amount_stars, currency,
+                    invoice_payload, telegram_payment_charge_id,
+                    status, created_at, purchased_at
+                ) VALUES (?, 'unknown', ?, ?, ?, ?, 'rejected', ?, ?)""",
+                (telegram_id, amount_stars, currency, invoice_payload, charge_id, _now(), _now()),
+            )
+            return "unknown_payload"
+        if purchase["telegram_payment_charge_id"] == charge_id:
+            return "duplicate"
+        if purchase["status"] != "pending":
+            return "already_processed"
+        if connection.execute(
+            "SELECT 1 FROM purchases WHERE telegram_payment_charge_id = ?",
+            (charge_id,),
+        ).fetchone():
+            return "duplicate_charge"
+        if (
+            int(purchase["telegram_id"]) != telegram_id
+            or purchase["product_id"] != product_id
+            or int(purchase["amount_stars"]) != amount_stars
+            or purchase["currency"] != currency
+        ):
+            connection.execute(
+                """UPDATE purchases SET status = 'rejected',
+                   telegram_payment_charge_id = ?, purchased_at = ? WHERE id = ?""",
+                (charge_id, _now(), purchase["id"]),
+            )
+            return "mismatch"
+        cursor = connection.execute(
+            """UPDATE purchases
+               SET status = 'paid', telegram_payment_charge_id = ?, purchased_at = ?
+               WHERE id = ? AND status = 'pending'""",
+            (charge_id, _now(), purchase["id"]),
+        )
+        return "paid" if cursor.rowcount == 1 else "already_processed"
+
+
+def has_product_access(telegram_id: int, product_id: str) -> bool:
+    with _connect() as connection:
+        return connection.execute(
+            """SELECT 1 FROM purchases
+               WHERE telegram_id = ? AND product_id = ? AND status = 'paid'
+               LIMIT 1""",
+            (telegram_id, product_id),
+        ).fetchone() is not None
+
+
+def get_user_purchases(telegram_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    limit = max(1, min(int(limit), 100))
+    with _connect() as connection:
+        rows = connection.execute(
+            """SELECT id, product_id, amount_stars, currency, status,
+                      created_at, purchased_at, refunded_at
+               FROM purchases WHERE telegram_id = ?
+               ORDER BY id DESC LIMIT ?""",
+            (telegram_id, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def get_purchase_by_id(purchase_id: int) -> dict[str, Any] | None:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT * FROM purchases WHERE id = ?", (purchase_id,)
+        ).fetchone()
+        return _dict(row)
+
+
+def mark_purchase_refunded(purchase_id: int) -> bool:
+    with _connect() as connection:
+        cursor = connection.execute(
+            """UPDATE purchases SET status = 'refunded', refunded_at = ?
+               WHERE id = ? AND status = 'paid'""",
+            (_now(), purchase_id),
+        )
+        return cursor.rowcount == 1
 
 
 # --------------------------------------------------

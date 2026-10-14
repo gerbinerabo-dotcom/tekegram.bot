@@ -10,6 +10,7 @@ import database
 from admin_handlers import register_admin_handlers
 from user_handlers import register_user_handlers
 from mafia_handlers import register_mafia_handlers
+from payment_handlers import register_payment_handlers
 
 
 def setup_logging() -> None:
@@ -56,6 +57,7 @@ def main() -> None:
     # Подключаем административные и пользовательские обработчики.
     register_admin_handlers(app)
     register_mafia_handlers(app)
+    register_payment_handlers(app)
     register_user_handlers(app)
 
     logger.info("Telegram-бот запускается...")

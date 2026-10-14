@@ -18,6 +18,19 @@ MAFIA_TEST_MODE = (
     in {"1", "true", "yes", "on"}
 )
 
+# Продажа Stars по умолчанию выключена. Включать можно только после подготовки
+# условий, поддержки и проверки требований Telegram и местного законодательства.
+MAFIA_PLUS_PAYMENTS_ENABLED = (
+    os.getenv("MAFIA_PLUS_PAYMENTS_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+try:
+    MAFIA_PLUS_PRICE_STARS = int(os.getenv("MAFIA_PLUS_PRICE_STARS", "100"))
+except ValueError as exc:
+    raise RuntimeError("MAFIA_PLUS_PRICE_STARS должен быть целым числом.") from exc
+if MAFIA_PLUS_PRICE_STARS <= 0:
+    raise RuntimeError("MAFIA_PLUS_PRICE_STARS должен быть больше нуля.")
+
 # Токен Telegram-бота
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 

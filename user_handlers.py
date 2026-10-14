@@ -111,7 +111,12 @@ async def help_command(
             "/start — начать общение\n"
             "/help — помощь\n"
             "/privacy — информация о приватности\n"
-            "/finance — личный учёт доходов и расходов"
+            "/finance — личный учёт доходов и расходов\n"
+            "/mafiastats — статистика игры «Мафия»\n"
+            "/buy — условия и покупка Mafia+\n"
+            "/mypurchases — статус покупок\n"
+            "/terms — условия Mafia+\n"
+            "/paysupport — помощь по оплате"
         )
 
 
